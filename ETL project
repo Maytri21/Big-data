@@ -1,0 +1,260 @@
+---Acess the data through S3 bucket make changes in Snowflake by creating dimension and fact tables the load it back in S3 bucket
+USE DATABASE regex;
+USE SCHEMA public;
+CREATE OR REPLACE STAGE my_s3_stage
+URL = 's3://test-maytri/'
+CREDENTIALS = (AWS_KEY_ID = 'Your Access Key' AWS_SECRET_KEY = 'Your Secret Key');
+show stages;
+CREATE OR REPLACE TABLE zomato_master (
+    url STRING,
+    address STRING,
+    name STRING,
+    online_order STRING,
+    book_table STRING,
+    rate STRING,
+    votes INT,
+    phone_number STRING,
+    location STRING,
+    rest_type STRING,
+    dish_liked STRING,
+    cuisines STRING,
+    approx_cost STRING,
+    listed_in_type STRING,
+    listed_in_city STRING,
+    menu_item STRING,
+    reviews_list STRING
+);
+COPY INTO zomato_master
+FROM @my_s3_stage/zomato.csv
+FILE_FORMAT = (TYPE = 'CSV' SKIP_HEADER = 1 FIELD_OPTIONALLY_ENCLOSED_BY = '"');
+select * from zomato_master;
+
+-- Order Dimension
+CREATE OR REPLACE TABLE order_dim (
+    order_id INT AUTOINCREMENT PRIMARY KEY,
+    online_order STRING,
+    book_table STRING
+);
+INSERT INTO order_dim (online_order, book_table)
+SELECT online_order, book_table FROM zomato_master;
+select * from order_dim;
+
+-- Restaurant Dimension
+CREATE OR REPLACE TABLE restaurant_dim (
+    rest_id INT AUTOINCREMENT PRIMARY KEY,
+    url STRING,
+    phone_number STRING,
+    name STRING,
+    rest_type STRING,
+    listed_in_type STRING,  
+    menu_item STRING
+);
+INSERT INTO restaurant_dim (url, phone_number, name, rest_type, listed_in_type, menu_item)
+SELECT url, phone_number, name, rest_type, listed_in_type, menu_item FROM zomato_master;
+
+-- Location Dimension
+CREATE OR REPLACE TABLE location_dim (
+    location_id INT AUTOINCREMENT PRIMARY KEY,
+    address STRING,
+    location STRING,
+    listed_in_city STRING   
+);
+INSERT INTO location_dim(address, location, listed_in_city)
+SELECT address, location, listed_in_city FROM zomato_master;
+select * from location_dim;
+
+-- Menu Dimension
+CREATE OR REPLACE TABLE menu_dim (
+    menu_id INT AUTOINCREMENT PRIMARY KEY,
+    dish_liked STRING,
+    cuisines STRING,
+    reviews_list STRING
+);
+INSERT INTO menu_dim(dish_liked, cuisines, reviews_list)
+SELECT dish_liked, cuisines, reviews_list FROM zomato_master;
+
+--- Restaurant fact
+CREATE OR REPLACE TABLE restaurant_fact (
+    rest_id INT,
+    rate STRING,
+    votes INT,
+    approx_cost STRING,
+    order_id INT,
+    location_id INT,
+    menu_id INT
+);
+INSERT INTO restaurant_fact (rest_id, rate, votes, approx_cost, order_id, location_id, menu_id)
+SELECT
+    r.rest_id,
+    z.rate,
+    z.votes,
+    z.approx_cost,
+    o.order_id,
+    l.location_id,
+    m.menu_id
+FROM (
+    SELECT *, ROW_NUMBER() OVER (ORDER BY (SELECT NULL)) AS rn FROM zomato_master
+) z
+JOIN (
+    SELECT *, ROW_NUMBER() OVER (ORDER BY (SELECT NULL)) AS rn FROM restaurant_dim
+) r ON z.rn = r.rn
+JOIN (
+    SELECT *, ROW_NUMBER() OVER (ORDER BY (SELECT NULL)) AS rn FROM order_dim
+) o ON z.rn = o.rn
+JOIN (
+    SELECT *, ROW_NUMBER() OVER (ORDER BY (SELECT NULL)) AS rn FROM location_dim
+) l ON z.rn = l.rn
+JOIN (
+    SELECT *, ROW_NUMBER() OVER (ORDER BY (SELECT NULL)) AS rn FROM menu_dim
+) m ON z.rn = m.rn;
+SELECT * FROM restaurant_fact LIMIT 10;
+
+---Join
+SELECT
+    r.name AS restaurant_name,
+    r.phone_number,
+    r.rest_type,
+    l.location,
+    l.listed_in_city,
+    o.online_order,
+    o.book_table,
+    m.cuisines,
+    f.rate,
+    f.votes,
+    f.approx_cost
+FROM restaurant_fact f
+JOIN restaurant_dim r ON f.rest_id = r.rest_id
+JOIN location_dim l ON f.location_id = l.location_id
+JOIN order_dim o ON f.order_id = o.order_id
+JOIN menu_dim m ON f.menu_id = m.menu_id;
+
+---Use Cases
+
+---top 10 most voted restaurants
+SELECT r.name, r.rest_type, f.votes
+FROM restaurant_fact f
+JOIN restaurant_dim r ON f.rest_id = r.rest_id
+ORDER BY f.votes DESC
+LIMIT 10;
+
+---Restaurants Offering Online Orders  vs buffet in a each location
+SELECT l.location, COUNT(CASE WHEN LOWER(o.online_order) = 'yes' THEN 1 END) AS online_order_count, COUNT(CASE WHEN LOWER(r.rest_type) LIKE '%buffet%' THEN 1 END) AS buffet_count
+FROM restaurant_fact f
+JOIN location_dim l ON f.location_id = l.location_id
+JOIN order_dim o ON f.order_id = o.order_id
+JOIN restaurant_dim r ON f.rest_id = r.rest_id
+GROUP BY l.location
+ORDER BY l.location;
+
+---Restaurants Offering Desserts vs Snacks in a Location
+SELECT l.location,COUNT(CASE WHEN LOWER(m.cuisines) LIKE '%dessert%' THEN 1 END) AS dessert_count,COUNT(CASE WHEN LOWER(m.cuisines) LIKE '%snacks%' THEN 1 END) AS snacks_count
+FROM restaurant_fact f
+JOIN menu_dim m ON f.menu_id = m.menu_id
+JOIN location_dim l ON f.location_id = l.location_id
+WHERE LOWER(l.location) = 'ulsoor' 
+GROUP BY l.location;
+
+---Restaurants with Book Table Feature Enabled vs offerting both services of online and book table
+SELECT r.name ,COUNT(CASE WHEN LOWER(o.book_table) = 'yes' AND LOWER(o.online_order) != 'yes' THEN 1 END) AS book_table_only_count, COUNT(CASE WHEN LOWER(o.book_table) = 'yes' AND LOWER(o.online_order) = 'yes' THEN 1 END) AS both_services_count
+FROM restaurant_fact f
+JOIN order_dim o ON f.order_id = o.order_id
+JOIN restaurant_dim r ON f.rest_id=r.rest_id
+GROUP BY r.name;
+
+---List of Restaurants with Phone Numbers Missing in each city with the average order received online or offline
+SELECT l.listed_in_city, COUNT(r.rest_id) AS total_missing_phone_restaurants, AVG(CASE WHEN LOWER(o.online_order) = 'yes' THEN 1 ELSE 0 END) AS avg_online_order, AVG(CASE WHEN LOWER(o.online_order) = 'no' THEN 1 ELSE 0 END) AS avg_offline_order
+FROM restaurant_fact f
+JOIN restaurant_dim r ON f.rest_id = r.rest_id
+JOIN order_dim o ON f.order_id = o.order_id
+JOIN location_dim l ON f.location_id = l.location_id
+WHERE r.phone_number IS NULL OR TRIM(r.phone_number) = ''
+GROUP BY l.listed_in_city
+ORDER BY total_missing_phone_restaurants DESC;
+
+---Compare Costly vs Affordable Restaurants Based on Cuisine
+SELECT m.cuisines, COUNT(CASE WHEN TRY_TO_DOUBLE(f.approx_cost) > 600 THEN 1 END) AS costly, COUNT(CASE WHEN TRY_TO_DOUBLE(f.approx_cost) <= 600 THEN 1 END) AS affordable
+FROM restaurant_fact f
+JOIN menu_dim m ON f.menu_id = m.menu_id
+GROUP BY m.cuisines
+ORDER BY costly DESC;
+
+--- Average Cost of Dining by Cuisine Type
+SELECT m.cuisines, AVG(TRY_TO_DOUBLE(f.approx_cost)) AS avg_cost
+FROM restaurant_fact f
+JOIN menu_dim m ON f.menu_id = m.menu_id
+GROUP BY m.cuisines
+ORDER BY avg_cost DESC;
+
+---Restaurants in a Particular Area Offering North Indian Cuisine and south indian cusine vs chinese cusine 
+SELECT l.location,COUNT(CASE WHEN LOWER(m.cuisines) LIKE '%north indian%' AND LOWER(m.cuisines) LIKE '%south indian%' THEN 1 END) AS north_south_count,COUNT(CASE WHEN LOWER(m.cuisines) LIKE '%chinese%' THEN 1 END) AS chinese_count
+FROM restaurant_fact f
+JOIN menu_dim m ON f.menu_id = m.menu_id
+JOIN location_dim l ON f.location_id = l.location_id
+WHERE LOWER(l.location) = 'indiranagar' 
+GROUP BY l.location;
+
+---Compare Restaurants With vs Without Ratings (NULL or ‘NEW’) Per Cuisine
+SELECT m.cuisines, COUNT(CASE WHEN TRY_TO_DOUBLE(f.rate) IS NOT NULL AND LOWER(f.rate) != 'new' THEN 1 END) AS rated_restaurants,COUNT(CASE WHEN TRY_TO_DOUBLE(f.rate) IS NULL OR LOWER(f.rate) = 'new' THEN 1 END) AS unrated_restaurants
+FROM restaurant_fact f
+JOIN menu_dim m ON f.menu_id = m.menu_id
+GROUP BY m.cuisines
+ORDER BY unrated_restaurants DESC;
+
+---Compare Buffet vs Café Restaurants in Each City
+SELECT l.listed_in_city,COUNT(CASE WHEN LOWER(r.rest_type) LIKE '%buffet%' THEN 1 END) AS buffet_count,COUNT(CASE WHEN LOWER(r.rest_type) LIKE '%cafe%' THEN 1 END) AS cafe_count
+FROM restaurant_fact f
+JOIN restaurant_dim r ON f.rest_id = r.rest_id
+JOIN location_dim l ON f.location_id = l.location_id
+GROUP BY l.listed_in_city
+ORDER BY buffet_count DESC;
+
+-- Export zomato_master
+COPY INTO @my_s3_stage/exports/zomato_master.csv
+FROM zomato_master
+FILE_FORMAT = (TYPE = 'CSV');
+
+-- Export order_dim
+COPY INTO @my_s3_stage/exports/order_dim.csv
+FROM order_dim
+FILE_FORMAT = (TYPE = 'CSV');
+
+-- Export restaurant_dim
+COPY INTO @my_s3_stage/exports/restaurant_dim.csv
+FROM restaurant_dim
+FILE_FORMAT = (TYPE = 'CSV');
+
+-- Export location_dim
+COPY INTO @my_s3_stage/exports/location_dim.csv
+FROM location_dim
+FILE_FORMAT = (TYPE = 'CSV');
+
+-- Export menu_dim
+COPY INTO @my_s3_stage/exports/menu_dim.csv
+FROM menu_dim
+FILE_FORMAT = (TYPE = 'CSV');
+
+-- Export restaurant_fact
+COPY INTO @my_s3_stage/exports/restaurant_fact.csv
+FROM restaurant_fact
+FILE_FORMAT = (TYPE = 'CSV') 
+OVERWRITE = TRUE;
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+  
